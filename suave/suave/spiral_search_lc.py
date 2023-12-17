@@ -3,12 +3,14 @@ from typing import Optional
 import rclpy
 
 from rcl_interfaces.msg import ParameterDescriptor, SetParametersResult
-from rclpy.lifecycle import Node
-from rclpy.lifecycle import Publisher
-from rclpy.lifecycle import State
-from rclpy.lifecycle import TransitionCallbackReturn
+from rclpy import Node
+from rclpy.action import ActionServer
 from rclpy.timer import Timer
 from suave.bluerov_gazebo import BlueROVGazebo
+from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
+from suave_msgs.action import Spiral
+from std_msgs.msg import Bool
+
 
 import std_msgs.msg
 import threading
@@ -27,7 +29,7 @@ def spiral_points(i, old_x, old_y, resolution=0.1, spiral_width=1.0):
         return x, y
 
 
-class SpiralSearcherLC(Node):
+class SpiralSearcherAC(Node):
 
     def __init__(self, node_name, **kwargs):
         self._enabled = False
@@ -39,6 +41,7 @@ class SpiralSearcherLC(Node):
         self.count = 0
         self.z_delta = 0
         self.old_spiral_altitude = -1
+        self.pipeline_detected = False
 
         super().__init__(node_name, **kwargs)
 
@@ -49,11 +52,28 @@ class SpiralSearcherLC(Node):
         self.declare_parameter(
             'spiral_altitude', 2.0, spiral_altitude_descriptor)
 
-        self.param_change_callback_handle = \
-            self.add_on_set_parameters_callback(self.param_change_callback)
+        self._action_server = ActionServer(
+            self,
+            Spiral,
+            'spiral',
+            self.execute_callback)
+        
+        self.pipeline_detected_sub = self.create_subscription(
+            Bool,
+            'pipeline/detected',
+            self.pipeline_detected_cb,
+            10,
+            callback_group=MutuallyExclusiveCallbackGroup())
+        
+        self.ardusub = BlueROVGazebo('bluerov_spiral_search')
 
-        self.trigger_configure()
 
+    def pipeline_detected_cb(self, msg):
+        self.pipeline_detected = msg.data
+        if self.pipeline_detected is True:
+            self.pipeline_detected_time = self.get_clock().now()
+        self.destroy_subscription(self.pipeline_detected_sub)
+        
     def param_change_callback(self, parameters):
         result = SetParametersResult()
         result.successful = True
@@ -64,6 +84,29 @@ class SpiralSearcherLC(Node):
                     parameter.value))
         return result
 
+
+    def execute_callback(self, goal_handle):
+        self.get_logger().info('Executing goal...')
+        
+
+        self.thread = threading.Thread(
+            target=rclpy.spin, args=(self.ardusub, ), daemon=True)
+        self.thread.start()
+        
+        self._timer_ = self.create_timer(self.timer_period, self.publish)
+    
+        
+        while not self.pipeline_detected:
+            pass
+            # self.get_logger().info("Waiting for pipleline to be detected..")
+        
+        goal_handle.succeed()
+        
+        result = Spiral.Result()
+
+        
+        return result
+    
     def publish(self):
         if self._enabled is True:
             self.spiral_altitude = self.get_parameter(
@@ -112,52 +155,16 @@ class SpiralSearcherLC(Node):
             else:
                 self.count += 1
 
-    def on_configure(self, state: State) -> TransitionCallbackReturn:
-        self.get_logger().info('on_configure() is called.')
-        self.ardusub = BlueROVGazebo('bluerov_spiral_search')
-
-        self.thread = threading.Thread(
-            target=rclpy.spin, args=(self.ardusub, ), daemon=True)
-        self.thread.start()
-
-        self._timer_ = self.create_timer(self.timer_period, self.publish)
-        return TransitionCallbackReturn.SUCCESS
-
-    def on_activate(self, state: State) -> TransitionCallbackReturn:
-        self.get_logger().info("on_activate() is called.")
-        self._enabled = True
-        return super().on_activate(state)
-
-    def on_deactivate(self, state: State) -> TransitionCallbackReturn:
-        self.get_logger().info("on_deactivate() is called.")
-        self._enabled = False
-        return super().on_deactivate(state)
-
-    def on_cleanup(self, state: State) -> TransitionCallbackReturn:
-        self.thread.join()
-        self.ardusub.destroy_node()
-        self.destroy_timer(self._timer)
-        self.get_logger().info('on_cleanup() is called.')
-        return TransitionCallbackReturn.SUCCESS
-
-    def on_shutdown(self, state: State) -> TransitionCallbackReturn:
-        self.thread.join()
-        self.ardusub.destroy_node()
-        self.destroy_timer(self._timer)
-        self.get_logger().info('on_shutdown() is called.')
-        return TransitionCallbackReturn.SUCCESS
-
-
 def main():
     rclpy.init()
 
     executor = rclpy.executors.MultiThreadedExecutor()
-    lc_node = SpiralSearcherLC('f_generate_search_path_node')
-    executor.add_node(lc_node)
+    ac_node = SpiralSearcherAC('f_generate_search_path_node')
+    executor.add_node(ac_node)
     try:
         executor.spin()
     except (KeyboardInterrupt, rclpy.executors.ExternalShutdownException):
-        lc_node.destroy_node()
+        ac_node.destroy_node()
 
 
 if __name__ == '__main__':
